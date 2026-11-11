@@ -1,164 +1,78 @@
 #!/usr/bin/env node
-// Command-line entry. `wait` is meant for an orchestrator that runs it as a
-// background shell command and is woken up when the command exits.
+import { parseArgs } from 'node:util'
+import fs from 'node:fs'
 import path from 'node:path'
-import * as core from './core.mjs'
-import { setup, stableNodePath } from './setup.mjs'
-import { runHook, parseHookInput } from './codex-hook.mjs'
+import { spawn } from 'node:child_process'
+import { call, connectCall } from './client.mjs'
+import { setup } from './setup.mjs'
+import { HOME, readJson } from './config.mjs'
 
-const USAGE = `Usage: dsh-baton <command> [args]
-
-  setup [--remove]                                        register the MCP server for Claude Code and Codex (user-wide)
-  codex-stop-hook                                         the Codex Stop hook of plugins 0.6.0–0.6.3, for conversations opened before 0.6.4
-  workspaces                                              list Harness sidebar workspaces (host plugin)
-  new-workspace <dir> [--title <t>]                       register (and create) a folder as a workspace
-  sessions [--cwd <dir>] [--query <text>] [--limit <n>]   list saved sessions
-  read <session_id> [--last <n>]                          show recent messages
-  send [--session <id> | --cwd <dir> | --workspace <id>] [--mode followup|steer] <message...>  start a run (message may be "-" for stdin)
-  status <run_id> | <session_id>                          show a run's progress, or a session's (with its goal)
-  wait <run_id> [--timeout <seconds>] [--until goal|turn] [--every 10m] [--cursor <c>]
-                                                          block until the run ends (or asks a person), print it; in a
-                                                          session with a Harness goal, until the goal stops
-  follow <session_id> [--until goal|turn] [--every 10m] [--cursor <c>] [--timeout <seconds>]
-                                                          follow a session's Harness goal without sending; print the next report
-  rename <session_id> <title>                             rename a session
-  rename-workspace <workspace_id|dir> <title>             rename a workspace (sidebar title)
-  activity <session_id>                                   what the session is doing now (turn, sub-agents, jobs)
-  cancel <run_id> | --session <id>                        stop the session's turn, sub-agents and jobs
-  queued <run_id> edit <message...> | remove | steer      change a message still waiting in Harness's queue
-  answer <run_id> '<answers JSON>'                         answer the questions a run is waiting on
-  runs [--session <id>] [--limit <n>]                     list recent runs`
-
-function parse(argv) {
-  const flags = {}, rest = []
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith('--')) flags[argv[i].slice(2)] = argv[++i]
-    else rest.push(argv[i])
-  }
-  return { flags, rest }
-}
-
-// This command line again, for a background command the client runs next (in Node mode when it
-// runs on Harness's own binary).
-const self = (args) => `${process.versions.electron ? 'ELECTRON_RUN_AS_NODE=1 ' : ''}"${stableNodePath()}" "${process.argv[1]}" ${args}`
-
-const print = (v) => console.log(JSON.stringify(v, null, 2))
-// --every 10m | 600s | 10 (minutes), default 10 minutes.
-function everySeconds(v) {
-  const every = String(v ?? '10m').match(/^(\d+)\s*(m|min|s)?$/i)
-  return every ? Number(every[1]) * (/^s$/i.test(every[2] ?? '') ? 1 : 60) : 600
-}
-
-async function readStdin() {
-  const chunks = []
-  for await (const c of process.stdin) chunks.push(c)
-  const buf = Buffer.concat(chunks)
-  // UTF-16 with its BOM (FF FE), as some Windows pipes write it; otherwise UTF-8.
-  return buf[0] === 0xff && buf[1] === 0xfe ? buf.subarray(2).toString('utf16le') : buf.toString()
-}
-
-async function main() {
-  const [cmd, ...argv] = process.argv.slice(2)
-  const { flags, rest } = parse(argv)
-  switch (cmd) {
-    case 'setup':
-      return console.log(await setup({ remove: argv.includes('--remove') }))
-    case 'codex-stop-hook': {
-      // Never fail the user's turn: on any error the hook prints nothing and the turn ends.
-      const input = parseHookInput(await readStdin().catch(() => ''))
-      if (!input) return
-      const out = await runHook(input, { shape: core.waitResult }).catch(() => null)
-      if (out) console.log(JSON.stringify(out))
-      return
-    }
-    case '_run':
-      return core.executeRun(rest[0])
-    case 'workspaces':
-      return print(await core.api.workspaces())
-    case 'new-workspace':
-      return print(await core.api.create_workspace({ path: rest[0], title: flags.title }))
-    case 'sessions':
-      return print(await core.api.list_sessions({ cwd: flags.cwd, query: flags.query, limit: Number(flags.limit) || 20 }))
-    case 'read':
-      return print(await core.api.read_session({ session_id: rest[0], last: Number(flags.last) || 10 }))
-    case 'send': {
-      const message = rest.join(' ') === '-' ? await readStdin() : rest.join(' ')
-      return print(await core.api.send({ message, sender: core.senderOf(), session_id: flags.session, cwd: flags.cwd, workspace_id: flags.workspace, ...(flags.mode ? { mode: flags.mode } : {}) }))
-    }
-    case 'status':
-      return print(await core.api.status(rest[0]?.startsWith('session') || flags.session ? { session_id: flags.session ?? rest[0] } : { run_id: rest[0] }))
-    case 'wait': {
-      const total_s = Number(flags.timeout) || 24 * 3600
-      const waitStarted = Date.now()
-      const st = await core.api.wait({ run_id: rest[0], timeout_s: total_s })
-      const stop = core.stopHint(st)
-      // A Harness goal goes on after the run's own round: so does this wait, until the goal
-      // stops (or the next report, with --until turn), with every round since the run began.
-      if (core.goalGoesOn(st)) {
-        const every_s = everySeconds(flags.every)
-        // --timeout bounds the whole command, the run and the goal after it.
-        const left = Math.max(1, total_s - Math.round((Date.now() - waitStarted) / 1000))
-        const f = core.throughGoal(st, core.followResult(await core.followThrough({ session_id: st.session_id, until: flags.until ?? 'goal', ...(flags.cursor ? { cursor: flags.cursor } : { since_ms: Date.parse(st.started_at) || Date.now() }), every_s }, { total_s: left })))
-        const again = f.cursor && ['report', 'following', 'needs_input'].includes(f.state)
-          ? self(`wait ${rest[0]} --until ${f.until} --cursor ${f.cursor}${f.until === 'turn' ? ` --every ${every_s}s` : ''}`)
-          : undefined
-        print({ ...f, ...(again ? { follow_command: again, hint: `${f.hint} To go on following, run follow_command in the background (not dsh_wait).` } : {}) })
-        process.exitCode = f.state === 'needs_input' ? 3 : 0
-        return
+const help = `Droid Baton — Codex → Factory Droid
+  node src/cli.mjs setup [--remove]         注册/移除 Codex MCP
+  node src/cli.mjs dashboard [--open]       本机任务面板
+  node src/cli.mjs models | workspaces | sessions | runs
+  node src/cli.mjs send --cwd /path "任务" [--check "npm test"]
+  node src/cli.mjs send --session ID --mode steer "补充要求"
+  node src/cli.mjs wait RUN_ID              阻塞等待完成/问题，可后台运行
+  node src/cli.mjs watch RUN_ID [--open]    实时监视同一任务（可另开终端）
+  node src/cli.mjs send --supervise ...     多轮目标监督；默认最多12轮/2次修复
+  node src/cli.mjs status RUN_ID
+  node src/cli.mjs cancel RUN_ID
+  node src/cli.mjs call METHOD '{"参数":"值"}'
+  node src/cli.mjs doctor | stop
+发送参数：--model ID --autonomy off|low|medium|high --timeout 秒 --check 命令（可重复）
+问题/权限通过面板或 call answer 回答；不自动代答。`
+const { values: v, positionals: pos } = parseArgs({ allowPositionals: true, options: { cwd: { type: 'string' }, session: { type: 'string' }, mode: { type: 'string' }, model: { type: 'string' }, autonomy: { type: 'string' }, timeout: { type: 'string' }, check: { type: 'string', multiple: true }, remove: { type: 'boolean' }, open: { type: 'boolean' }, supervise: { type: 'boolean' }, 'keep-open': { type: 'boolean' }, help: { type: 'boolean', short: 'h' } } })
+const print = data => process.stdout.write(JSON.stringify(data, null, 2) + '\n')
+try {
+  const cmd = pos[0]
+  if (!cmd || v.help || cmd === 'help') process.stdout.write(help + '\n')
+  else if (cmd === 'setup') print(setup({ remove: v.remove }))
+  else if (cmd === 'stop') {
+    const info = readJson(path.join(HOME, 'broker.json'))
+    const live = await connectCall('ping', {}, { timeout: 1000 }).catch(() => null)
+    if (live && live.pid === info?.pid) { process.kill(live.pid, 'SIGTERM'); print({ stopped: true, pid: live.pid }) }
+    else print({ stopped: false, message: '服务未运行。' })
+  } else if (cmd === 'doctor') {
+    const info = await call('ping'); const models = await call('list_models')
+    print({ ...info, model_count: models.models?.length, node: process.version, data_permissions: (fs.statSync(HOME).mode & 0o777).toString(8), note: '仅验证接口，不证明模型请求或工具执行可用。' })
+  } else if (cmd === 'send') {
+    print(await call('send', { message: pos.slice(1).join(' '), ...(v.cwd ? { cwd: v.cwd } : {}), ...(v.session ? { session_id: v.session } : {}), ...(v.mode ? { mode: v.mode } : {}), ...(v.model ? { model: v.model } : {}), ...(v.autonomy ? { autonomy: v.autonomy } : {}), ...(v.timeout ? { timeout_s: Number(v.timeout) } : {}), ...(v.supervise ? { supervision: true } : {}), checks: v.check || [] }))
+  } else if (cmd === 'wait') {
+    let result
+    for (;;) { result = await call('wait', { run_id: pos[1], timeout_s: 50 }); if (!result.timed_out) break }
+    print(result)
+    if (['failed', 'cancelled', 'interrupted'].includes(result.state) || result.evidence?.all_checks_passed === false) process.exitCode = 1
+    else if (result.needs_input) process.exitCode = 2
+    else if (result.needs_attention) process.exitCode = 3
+  } else if (cmd === 'watch') {
+    if (v.open) print(await call('open_terminal', { run_id: pos[1] }))
+    else {
+      process.stdout.write('Droid Baton · 执行监视（Ctrl+C 只关闭监视，不停止任务）\n')
+      const plain = s => String(s || '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '')
+      let revision = -1, seq = 0, state, text = '', notice
+      for (;;) {
+        const r = await call('observe', { run_id: pos[1], after_revision: revision, timeout_s: 50 }); revision = r.revision || 0
+        if (r.state !== state) { process.stdout.write(`\n[${r.state}] ${r.supervisor ? `第 ${r.supervisor.round} 轮` : ''}\n`); state = r.state }
+        for (const e of r.recent_events || []) if ((e.seq || 0) > seq) {
+          seq = e.seq
+          if (e.type !== 'assistant') process.stdout.write(plain(`${e.time.slice(11, 19)} ${e.name || e.type} ${e.input || e.error || ''}`) + '\n')
+        }
+        const next = r.partial_text || r.final_text || ''
+        if (next !== text) { process.stdout.write(plain(next.startsWith(text) ? next.slice(text.length) : '\n' + next)); text = next }
+        if (r.attention && r.attention.id !== notice) { notice = r.attention.id; process.stdout.write('\n需要主控判断：' + plain(r.attention.message) + '\n') }
+        if (['completed', 'failed', 'cancelled', 'interrupted'].includes(r.state)) { process.stdout.write(`\n任务结束：${r.state}\n`); break }
       }
-      if (st.needs_input && st.question) {
-        const { run_id, state, session_id, needs_input, question } = st
-        print(core.asking({ run_id, state, session_id, needs_input, question }, core.askHint(question.count ?? question.questions?.length ?? 1, 'dsh_answer (or dsh-baton answer)', 'wait again')))
-        process.exitCode = 3
-        return
-      }
-      print({
-        ...(st.decided_for_user ? { hint: `${core.DECIDED_HINT} ${core.endedHint(st)}`, decided_for_user: st.decided_for_user } : {}),
-        run_id: st.run_id, state: st.state, session_id: st.session_id, timed_out: !!st.timed_out, error: st.error, final_text: st.final_text,
-        // A goal goes on after this run: the hint says so and how to follow it.
-        ...(st.goal ? { goal: st.goal, ...(st.goal.phase === 'active' ? { follow_command: self(`follow ${st.session_id}`) } : {}) } : {}),
-        // The hint points at evidence: it goes with it (files changed, checks run, other runs in the folder).
-        ...(st.evidence ? { evidence: st.evidence } : {}),
-        ...(st.state === 'completed' && !st.decided_for_user ? { hint: core.endedHint(st) } : {}),
-        // Stopped by the user, cancelled, or cut off by a Harness restart: say so, or the client
-        // takes it for a failure in the work and sends it again.
-        ...(st.harness_down ? { harness_down: true, hint: core.harnessDownHint('run this same wait command again') } : {}),
-        ...(stop ? { ...(st.turn_end ? { turn_end: st.turn_end } : {}), ...stop } : {}),
-        ...(st.needs_input ? { needs_input: st.needs_input, hint: 'The run waits for a person in the Harness UI. Tell the user, then wait again.' } : {}) })
-      process.exitCode = st.state === 'completed' ? 0 : st.needs_input ? 3 : 1
-      return
+      if (v['keep-open'] && process.stdin.isTTY) { process.stdout.write('按 Enter 关闭窗口。\n'); await new Promise(resolve => { process.stdin.resume(); process.stdin.once('data', resolve) }); process.stdin.pause() }
     }
-    case 'follow': {
-      // Until the next report: waits in one call (no hour limit here), so a background
-      // command wakes its client exactly then. --timeout makes it come back sooner.
-      const every_s = everySeconds(flags.every)
-      const st = core.followResult(await core.followThrough({ session_id: rest[0], until: flags.until ?? 'goal', cursor: flags.cursor, every_s }, { total_s: Number(flags.timeout) || 24 * 3600 }))
-      const again = st.cursor && ['report', 'following', 'needs_input'].includes(st.state)
-        ? self(`follow ${rest[0]} --until ${st.until} --cursor ${st.cursor}${st.until === 'turn' ? ` --every ${every_s}s` : ''}`)
-        : undefined
-      print({ ...st, ...(again ? { follow_command: again, hint: `${st.hint} To go on following, run follow_command in the background (not dsh_wait).` } : {}) })
-      process.exitCode = st.state === 'needs_input' ? 3 : 0
-      return
+  } else if (cmd === 'dashboard') {
+    const info = await call('dashboard'); print(info)
+    if (v.open) {
+      const file = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer.exe' : 'xdg-open'
+      const proc = spawn(file, [info.url], { detached: true, stdio: 'ignore' }); proc.on('error', error => process.stderr.write(error.message + '\n')); proc.unref()
     }
-    case 'cancel':
-      return print(await core.api.cancel(rest[0]?.startsWith('session') || flags.session ? { session_id: flags.session ?? rest[0] } : { run_id: rest[0] }))
-    case 'queued':
-      return print(await core.api.update_queued({ run_id: rest[0], action: rest[1], ...(rest[1] === 'edit' ? { message: rest.slice(2).join(' ') } : {}) }))
-    case 'answer':
-      return print(await core.api.answer({ run_id: rest[0], answers: JSON.parse(rest.slice(1).join(' ')) }))
-    case 'rename':
-      return print(await core.api.rename_session({ session_id: rest[0], title: rest.slice(1).join(' ') }))
-    case 'rename-workspace':
-      // A path (also C:\… on Windows) or a workspace id.
-      return print(await core.api.rename_workspace(rest[0]?.startsWith('/') || rest[0]?.startsWith('~') || path.isAbsolute(rest[0] ?? '') ? { path: rest[0], title: rest.slice(1).join(' ') } : { workspace_id: rest[0], title: rest.slice(1).join(' ') }))
-    case 'activity':
-      return print(await core.api.activity({ session_id: rest[0] }))
-    case 'runs':
-      return print(await core.api.list_runs({ limit: Number(flags.limit) || 10, session_id: flags.session }))
-    default:
-      console.error(USAGE)
-      process.exitCode = cmd ? 2 : 0
-  }
-}
-
-main().catch((e) => { console.error(`dsh-baton: ${e.message}`); process.exitCode = 1 })
+  } else if (cmd === 'call') print(await call(pos[1], JSON.parse(pos[2] || '{}')))
+  else if (['status', 'cancel'].includes(cmd)) print(await call(cmd, v.session ? { session_id: v.session } : { run_id: pos[1] }))
+  else if ({ models: 1, workspaces: 1, sessions: 1, runs: 1 }[cmd]) print(await call(`list_${cmd}`, v.cwd ? { cwd: v.cwd } : {}))
+  else throw new Error(`未知命令：${cmd}\n${help}`)
+} catch (error) { process.stderr.write(error.message + '\n'); process.exitCode = 1 }

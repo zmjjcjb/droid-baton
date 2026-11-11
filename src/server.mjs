@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const START_TIMEOUT_MS = Number(process.env.DSH_BATON_START_TIMEOUT_MS) || 15000
+const START_TIMEOUT_MS = Number(process.env.DROID_BATON_START_TIMEOUT_MS) || 15000
 // The client that started this shell. Its children (one more after each hot update) are told
 // it: mcp.mjs judges Codex's wait by when the Codex process started.
 const CLIENT_PID = String(process.ppid)
@@ -42,7 +42,7 @@ function startChild() {
   const proc = spawn(process.execPath, [path.join(ROOT, 'src', 'mcp.mjs')], {
     stdio: ['pipe', 'pipe', 'inherit'],
     windowsHide: true,
-    env: { ...process.env, DSH_BATON_CLIENT_PID: CLIENT_PID, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) },
+    env: { ...process.env, DROID_BATON_CLIENT_PID: CLIENT_PID, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) },
   })
   const child = {
     proc,
@@ -52,7 +52,7 @@ function startChild() {
     exited: false,
     write(msg) { if (!this.exited && proc.stdin.writable) proc.stdin.write(JSON.stringify(msg) + '\n') },
     request(method, params) {
-      const id = `dsh-baton-shell-${++nextInternal}`
+      const id = `droid-baton-shell-${++nextInternal}`
       return new Promise((resolve, reject) => {
         this.internal.set(id, { resolve, reject })
         this.write({ jsonrpc: '2.0', id, method, params })
@@ -84,7 +84,7 @@ function startChild() {
   proc.on('exit', (code) => {
     child.exited = true
     children.delete(child)
-    for (const [id, rewrite] of child.clientCalls) if (rewrite !== CANCELLED) send({ jsonrpc: '2.0', id, error: { code: -32603, message: `The dsh-baton server process stopped (exit code ${code}).` } })
+    for (const [id, rewrite] of child.clientCalls) if (rewrite !== CANCELLED) send({ jsonrpc: '2.0', id, error: { code: -32603, message: `The droid-baton server process stopped (exit code ${code}).` } })
     for (const [, own] of child.internal) own.reject(new Error(`exited with code ${code}`))
     child.clientCalls.clear()
     child.internal.clear()
@@ -141,7 +141,7 @@ async function reloadIfInstalled() {
     current = next
     currentStamp = now
     currentVersion = init?.serverInfo?.version ?? null
-    note = `dsh-baton was updated from ${before} to ${currentVersion} without a restart; this call already used ${currentVersion}.` +
+    note = `droid-baton was updated from ${before} to ${currentVersion} without a restart; this call already used ${currentVersion}.` +
       (added.length ? ` New in this version: ${added.join(', ')}. If this conversation does not show them, call them through dsh_call {name, arguments}.` : '')
     if (lastTools !== null && JSON.stringify(tools) !== lastTools) {
       lastTools = JSON.stringify(tools)
@@ -151,7 +151,7 @@ async function reloadIfInstalled() {
     next.proc.kill()
     failedStamp = now
     const version = now.split('@')[0]
-    note = `A new dsh-baton (${version}) is installed but could not be started (${e.message}); this call still used ${currentVersion}. Restart this client to load it, or reinstall.`
+    note = `A new droid-baton (${version}) is installed but could not be started (${e.message}); this call still used ${currentVersion}. Restart this client to load it, or reinstall.`
   }
 }
 
@@ -206,7 +206,7 @@ let queue = Promise.resolve()
 const rl = readline.createInterface({ input: process.stdin })
 rl.on('line', (line) => {
   if (!line.trim()) return
-  queue = queue.then(() => route(line)).catch((e) => process.stderr.write(`dsh-baton: ${e.stack ?? e}\n`))
+  queue = queue.then(() => route(line)).catch((e) => process.stderr.write(`droid-baton: ${e.stack ?? e}\n`))
 })
 
 // Exit once the client is gone and every child has answered and stopped.

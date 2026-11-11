@@ -1,4 +1,0 @@
-# dsh-baton-host bundle layer: mounts the single host plugin row.
-- insert:
-    - id: dsh-baton-host
-      name: dsh-baton-host

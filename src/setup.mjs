@@ -1,167 +1,40 @@
-// `dsh-baton setup`: register the dsh-baton MCP server for Claude Code and Codex, user-wide
-// (see register.mjs, which the Harness plugin also uses), and say what is left to do in Harness.
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { ROOT, VERSION, config, hostAvailable, hostVersionSeen as versionOfHost, versionWarning } from './core.mjs'
-import { appDir, installApp, rewrite, stableNodePath, claudeConfigPath, codexConfigPath, editClaudeConfig, editCodexConfig, removeCodexHookBlock, noteCodexToolTimeout, readCodexToolTimeout } from './register.mjs'
+import { ROOT, HOME } from './config.mjs'
 
-export { appDir, installApp, stableNodePath, claudeConfigPath, codexConfigPath, editClaudeConfig, editCodexConfig }
-
-function copyToClipboard(text) {
-  try {
-    if (process.platform === 'darwin') execFileSync('pbcopy', { input: text })
-    else if (process.platform === 'win32') execFileSync('clip', { input: text })
-    else return false
-    return true
-  } catch {
-    return false
+export function setup({ remove = false } = {}) {
+  const config = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'config.toml')
+  fs.mkdirSync(path.dirname(config), { recursive: true, mode: 0o700 })
+  const before = fs.existsSync(config) ? fs.readFileSync(config, 'utf8') : ''
+  const backup = `${config}.bak-droid-baton-${Date.now()}`
+  if (before) fs.writeFileSync(backup, before, { mode: 0o600 })
+  let droidBin = process.env.DROID_BIN
+  if (!remove && !droidBin) {
+    try { droidBin = execFileSync(process.platform === 'win32' ? 'where' : 'which', ['droid'], { encoding: 'utf8' }).trim().split(/\r?\n/)[0] } catch { throw new Error('找不到 Droid；先安装 Droid 或设置 DROID_BIN。') }
   }
-}
-
-// Where the Harness desktop profile links the plugin from, under its current name and
-// under the name before the rename (dsh-bridge-host), if anywhere.
-function installedPlugins() {
-  try {
-    const deps = JSON.parse(fs.readFileSync(path.join(config.dshHome, 'profiles', 'desktop', 'package.json'), 'utf8')).dependencies ?? {}
-    return { current: deps['dsh-baton-host'] ?? null, old: deps['dsh-bridge-host'] ?? null }
-  } catch {
-    return { current: null, old: null }
-  }
-}
-
-// With pnpm's hoisted layout, uninstalling the plugin can leave its node_modules link
-// behind. Remove such a link once the profile no longer lists the plugin; only the
-// link itself goes, never the folder it points to. Returns the links removed and the
-// ones that could not be.
-export function cleanStalePluginLinks(profile = path.join(config.dshHome, 'profiles', 'desktop')) {
-  let deps
-  try { deps = JSON.parse(fs.readFileSync(path.join(profile, 'package.json'), 'utf8')).dependencies ?? {} } catch { return { removed: [], failed: [] } }
-  const removed = [], failed = []
-  for (const name of ['dsh-baton-host', 'dsh-bridge-host']) {
-    const link = path.join(profile, 'node_modules', name)
-    if (deps[name]) continue
-    let st
-    try { st = fs.lstatSync(link) } catch { continue }
-    if (!st.isSymbolicLink()) continue
-    try {
-      // A Windows junction is a directory link: rmdir removes the link, not its target.
-      try { fs.unlinkSync(link) } catch { fs.rmdirSync(link) }
-      removed.push(link)
-    } catch {
-      failed.push(link)
+  // Do not round-trip the user's file through `codex mcp add`: its serializer can
+  // normalize or discard fields of OTHER MCP entries. Replace only our tables.
+  let skip = false
+  const kept = before.split(/\r?\n/).filter(line => {
+    if (/^\s*\[/.test(line)) {
+      skip = /^\s*\[mcp_servers\.(?:droid-baton|"droid-baton"|'droid-baton')(?:\.[^\]]+)?\]\s*(?:#.*)?$/.test(line)
     }
-  }
-  return { removed, failed }
-}
-
-// What setup says about the Harness plugin. The plugin is installed in Harness by its npm
-// package name; a checkout of this repo (setup run from a git clone) is the exception and
-// links its own host folder, so plugin changes can be tried before they are published.
-export function pluginSteps({ current, old }, running, hostDir, fromSource = fs.existsSync(path.join(ROOT, '.git'))) {
-  const isLink = (spec) => /^(link|file):/.test(spec ?? '')
-  const ok = fromSource ? pluginFrom(current, hostDir) : current && !isLink(current)
-  if (ok && !old && running) {
-    const warning = versionWarning(running)
-    return warning ? ['Harness plugin: running, but out of step.', `  ${warning}`] : [`Harness plugin: running (${running}).`]
-  }
-  const steps = ['Last step, in DeepSeek Harness:']
-  // The plugin was renamed: Harness cannot load the old entry once its folder holds the new name.
-  if (old) steps.push('  The plugin is installed under its old name: first Plugins (插件) → dsh-bridge-host → Uninstall (卸载).')
-  if (current && !ok) {
-    steps.push(isLink(current)
-      ? `  The plugin installed now comes from a local folder (${current.replace(/^(link|file):/, '')}): first Plugins (插件) → dsh-baton-host → Uninstall (卸载).`
-      : '  The plugin installed now comes from npm, not this checkout: first Plugins (插件) → dsh-baton-host → Uninstall (卸载).')
-  }
-  if (ok && !old) return ['Harness plugin: installed but not answering. Open Harness and check that dsh-baton-host is switched on in Plugins (插件).']
-  if (fromSource) {
-    const copied = copyToClipboard(hostDir)
-    steps.push(`  Plugins (插件) → Add plugin (添加插件) → paste ${copied ? 'the path (already copied)' : 'this path'}: ${hostDir}`)
-  } else {
-    const copied = copyToClipboard(PLUGIN)
-    steps.push(`  Plugins (插件) → Add plugin (添加插件) → registry: Official npm registry → package: ${PLUGIN}${copied ? ' (already copied)' : ''}`)
-  }
-  steps.push('  → Install (安装) → Enable now (立即启用)')
-  return steps
-}
-
-const PLUGIN = 'dsh-baton-host'
-
-const pluginFrom = (source, hostDir) => source === `link:${hostDir}` || source === `link:${hostDir.split(path.sep).join('/')}`
-
-// Run through npx, the package sits in npm's cache, which npm may clear or replace at any
-// time. setup then copies it to a stable folder and registers that copy instead.
-export const inNpxCache = (root = ROOT) => root.split(/[\\/]/).includes('_npx')
-
-export function sameVersionAt(dir, version = VERSION) {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version === version && fs.existsSync(path.join(dir, 'src', 'server.mjs'))
-  } catch {
-    return false
-  }
-}
-
-export async function setup({ remove = false } = {}) {
-  // The same version is already in place (the Harness plugin copied it, say): leave it.
-  const copy = !remove && inNpxCache() && !sameVersionAt(appDir())
-  const root = !remove && inNpxCache() ? (copy ? installApp(ROOT) : appDir()) : ROOT
-  const entry = remove ? null : { command: stableNodePath(), args: [path.join(root, 'src', 'server.mjs')] }
-  const lines = []
-  if (root !== ROOT) lines.push(copy ? `Installed dsh-baton to ${root}` : `dsh-baton ${VERSION} is already in ${root}`)
-  const register = (label, file, present, edit) => {
-    if (!remove && !present) return lines.push(`- ${label}: not installed, skipped`)
-    try {
-      const result = rewrite(file, (t) => edit(t, entry))
-      const what = remove
-        ? (result === 'unchanged' ? 'not registered in' : 'removed from')
-        : 'registered in'
-      lines.push(`- ${label}: ${what} ${file}${!remove && result === 'unchanged' ? ' (already up to date)' : ''}`)
-    } catch (e) {
-      lines.push(`- ${label}: FAILED to edit ${file}: ${e.message}`)
-      process.exitCode = 1
-    }
-  }
-  const claudeFile = claudeConfigPath()
-  register('Claude Code', claudeFile, fs.existsSync(claudeFile) || fs.existsSync(path.join(os.homedir(), '.claude')), editClaudeConfig)
-  const codexFile = codexConfigPath()
-  const hadTimeout = fs.existsSync(codexFile) && readCodexToolTimeout(fs.readFileSync(codexFile, 'utf8')) !== null
-  register('Codex', codexFile, fs.existsSync(path.dirname(codexFile)), editCodexConfig)
-  if (!remove && fs.existsSync(codexFile)) noteCodexToolTimeout(codexFile, undefined, undefined, !hadTimeout)
-  // The Codex Stop hook plugins 0.6.0–0.6.3 added goes too, as the plugin takes it out.
-  if (fs.existsSync(codexFile)) {
-    try {
-      if (rewrite(codexFile, (t) => removeCodexHookBlock(t, codexFile)) !== 'unchanged') lines.push(`- Codex Stop hook: removed from ${codexFile}`)
-    } catch (e) {
-      lines.push(`- Codex Stop hook: FAILED to edit ${codexFile}: ${e.message}`)
-      process.exitCode = 1
-    }
-  }
-
-  if (remove) {
-    const plugins = installedPlugins()
-    if (plugins.current || plugins.old) {
-      lines.push('', `To remove the Harness plugin: Harness → Plugins → ${plugins.current ? 'dsh-baton-host' : 'dsh-bridge-host'} → Uninstall.`)
-    } else {
-      lines.push('', 'Harness plugin: not installed.')
-      const links = cleanStalePluginLinks()
-      for (const l of links.removed) lines.push(`Removed the leftover plugin link ${l}.`)
-      for (const l of links.failed) lines.push(`Could not remove the leftover plugin link ${l}: quit Harness and delete it.`)
-    }
-    const app = appDir()
-    if (fs.existsSync(app)) {
-      // Harness loads the plugin from this folder: delete it only once the plugin is gone.
-      if (pluginFrom(plugins.current, path.join(app, 'host'))) lines.push(`Then run this again to delete ${app}.`)
-      else { fs.rmSync(app, { recursive: true, force: true }); lines.push(`Deleted ${app}.`) }
-    }
-    const home = config.batonHome
-    if (['runs', 'host-runs'].some((d) => fs.existsSync(path.join(home, d)))) {
-      lines.push(`Run records are kept in ${home} (runs, host-runs); delete that folder to remove them too.`)
-    }
-    return lines.join('\n')
-  }
-  lines.push('', 'MCP server registered user-wide: new conversations in Claude Code and Codex have the dsh_* tools.')
-
-  lines.push('', ...pluginSteps(installedPlugins(), await hostAvailable() ? versionOfHost() : null, path.join(root, 'host')))
-  return lines.join('\n')
+    return !skip
+  }).join('\n').trimEnd()
+  const own = remove ? '' : [
+    '[mcp_servers.droid-baton]',
+    `command = ${JSON.stringify(process.execPath)}`,
+    `args = [${JSON.stringify(path.join(ROOT, 'src/server.mjs'))}]`,
+    `cwd = ${JSON.stringify(os.homedir())}`,
+    'tool_timeout_sec = 3600',
+    '', '[mcp_servers.droid-baton.env]',
+    `DROID_BIN = ${JSON.stringify(droidBin)}`,
+    `DROID_BATON_HOME = ${JSON.stringify(HOME)}`,
+  ].join('\n')
+  const text = [kept, own].filter(Boolean).join('\n\n') + '\n'
+  const tmp = `${config}.${process.pid}.tmp`
+  fs.writeFileSync(tmp, text, { mode: 0o600 }); fs.renameSync(tmp, config)
+  return { registered: !remove, config, backup: before ? backup : undefined, message: remove ? 'Removed only the droid-baton MCP entry.' : 'Registered only the droid-baton MCP entry.', next: remove ? '只移除 MCP 注册；任务服务和运行记录保留。' : '在 Codex 新建聊天以加载 droid_* 工具。当前聊天的工具目录不保证即时更新。' }
 }

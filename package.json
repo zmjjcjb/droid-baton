@@ -1,51 +1,12 @@
 {
-  "name": "dsh-baton-mcp",
-  "version": "0.6.11",
-  "mcpName": "io.github.JialaoLiu/dsh-baton",
-  "description": "Pass the baton from Claude Code, Codex or any MCP client to a local DeepSeek Harness: an MCP server that hands off tasks, continues a specific session, shows the run live in Harness and hands the result back when it is done.",
+  "name": "droid-baton-mcp",
+  "version": "0.2.1",
+  "description": "A Baton-derived local MCP bridge from Codex to Factory Droid, with live supervision and independent evidence.",
   "type": "module",
-  "bin": {
-    "dsh-baton": "src/cli.mjs",
-    "dsh-baton-mcp": "src/bin.mjs"
-  },
-  "files": [
-    "src",
-    "host/lib",
-    "host/package.json",
-    "host/cordis.patch.yml",
-    "host/README.md",
-    "host/LICENSE",
-    "patches",
-    "README.md",
-    "README.zh-CN.md",
-    "WINDOWS.md",
-    "LICENSE",
-    "server.json"
-  ],
-  "engines": {
-    "node": ">=22.15"
-  },
-  "keywords": [
-    "mcp",
-    "deepseek",
-    "deepseek-harness",
-    "claude-code",
-    "codex",
-    "multi-agent",
-    "orchestration"
-  ],
+  "private": true,
   "license": "MIT",
-  "scripts": {
-    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
-    "test:live": "node tests/live.mjs",
-    "prepublishOnly": "node scripts/version.mjs"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/JialaoLiu/dsh-baton.git"
-  },
-  "homepage": "https://github.com/JialaoLiu/dsh-baton#readme",
-  "bugs": {
-    "url": "https://github.com/JialaoLiu/dsh-baton/issues"
-  }
+  "engines": { "node": ">=22.15" },
+  "bin": { "droid-baton": "src/cli.mjs", "droid-baton-mcp": "src/server.mjs" },
+  "scripts": { "test": "node --test --test-concurrency=1 tests/*.test.mjs", "start": "node src/server.mjs", "dashboard": "node src/cli.mjs dashboard", "setup": "node src/cli.mjs setup", "test:live": "node scripts/live.mjs" },
+  "files": ["src", "web", "README.md", "LICENSE", "NOTICE.md", "docs" ]
 }

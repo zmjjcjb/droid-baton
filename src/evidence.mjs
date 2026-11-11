@@ -1,7 +1,7 @@
-// Evidence for a finished run that does not come from the Harness model: which files the run
-// created, changed or deleted (a snapshot of the folder taken at dsh_send, compared when the
-// run ends), and the result of check commands the client gave with dsh_send, run here by
-// dsh-baton in that folder. The Harness reply can say "all tests pass"; this says whether
+// Evidence for a finished run that does not come from the Droid model: which files the run
+// created, changed or deleted (a snapshot of the folder taken at droid_send, compared when the
+// run ends), and the result of check commands the client gave with droid_send, run here by
+// droid-baton in that folder. The Droid reply can say "all tests pass"; this says whether
 // they do. Kept in a file per run, because the client may wait from another process.
 import fs from 'node:fs'
 import path from 'node:path'
@@ -11,7 +11,7 @@ import { spawnSync } from 'node:child_process'
 const SKIP = new Set(['node_modules', '.git', '.hg', '.svn', 'dist', 'build', '.next', '.cache', 'coverage', '__pycache__', '.venv', 'venv', 'target', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.tox', '.gradle'])
 // Files no one wrote on purpose.
 const SKIP_FILES = new Set(['.DS_Store', 'Thumbs.db'])
-// Files looked at (by size and time only) and, of those, the newest read at dsh_send for a
+// Files looked at (by size and time only) and, of those, the newest read at droid_send for a
 // line count and hash. A folder full of reference material (thousands of files) used to fill
 // a 3000-file cap in directory order, so the files the run worked on were never seen.
 const MAX_ENTRIES = 100_000
@@ -23,7 +23,7 @@ const TAIL_LINES = 15
 const DAY_MS = 24 * 3600 * 1000
 
 const fileOf = (home, runId) => path.join(home, 'evidence', `${String(runId).replace(/[^\w.-]/g, '_')}.json`)
-// The folder snapshot taken at dsh_send, apart from the small record: it can be megabytes, and
+// The folder snapshot taken at droid_send, apart from the small record: it can be megabytes, and
 // the records of other runs are read for every collect.
 const beforeOf = (file) => file.replace(/\.json$/, '.before.json')
 const isBefore = (name) => name.endsWith('.before.json')
@@ -73,6 +73,13 @@ function snapshot(dir) {
   return { files, truncated }
 }
 
+// Cheap freshness check for review-time drift, with the same explicit snapshot
+// limits as the evidence engine. It is not an adversarial filesystem attestation.
+export function fingerprint(dir) {
+  const { list, truncated } = walk(dir)
+  return crypto.createHash('sha256').update(JSON.stringify({ truncated, files: list.map(f => [f.rel, f.m, f.s]).sort((a, b) => a[0].localeCompare(b[0])) })).digest('hex')
+}
+
 // The files under dir changed since a time, for a follow report: how many, per folder, and
 // the newest by name (progress notes such as STATUS or CHECKLIST files first).
 const PROGRESS_FILE = /status|checklist|progress|todo|changelog|plan/i
@@ -103,7 +110,9 @@ export function prepare(home, { run_id, session_id = null, cwd, checks }) {
     fs.writeFileSync(file, JSON.stringify({ cwd, session_id, checks: list, at: Date.now() }), { mode: 0o600 })
     // Keep the folder small: the 50 newest runs (with their snapshots).
     const dir = path.join(home, 'evidence')
-    const old = fs.readdirSync(dir).filter((n) => !isBefore(n)).map((n) => ({ n, t: fs.statSync(path.join(dir, n)).mtimeMs })).sort((a, b) => b.t - a.t).slice(50)
+    const old = fs.readdirSync(dir).filter((n) => !isBefore(n)).filter(n => {
+      try { const r = JSON.parse(fs.readFileSync(path.join(home, 'host-runs', n), 'utf8')); return ['completed', 'failed', 'cancelled', 'interrupted'].includes(r.state) } catch { return true }
+    }).map((n) => ({ n, t: fs.statSync(path.join(dir, n)).mtimeMs })).sort((a, b) => b.t - a.t).slice(50)
     for (const { n } of old) { fs.rmSync(path.join(dir, n), { force: true }); fs.rmSync(beforeOf(path.join(dir, n)), { force: true }) }
   } catch { /* evidence is extra; sending never fails over it */ }
 }
@@ -202,7 +211,8 @@ export function collect(home, runId) {
     checks.push(left > 1000 ? runCheck(c, rec.cwd, Math.min(CHECK_TIMEOUT_MS, left)) : { command: c, skipped: 'out of time' })
   }
   const result = {
-    source: 'dsh-baton, not the Harness model',
+    source: 'droid-baton, not the Droid model',
+    workspace_stamp: fingerprint(rec.cwd),
     changes: { created, modified, deleted, ...(after.truncated || snap.truncated ? { truncated: true } : {}) },
     ...(overlapping.length ? { same_folder_runs: overlapping } : {}),
     ...(checks.length ? { checks, all_checks_passed: checks.every((c) => c.passed) } : {}),
