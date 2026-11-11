@@ -4,6 +4,8 @@
 
 当前版本 0.2.1，已在 Linux、Node 22.23.4、Droid 0.240.0 验证。保留原 MIT 许可证与署名，派生关系见 [NOTICE.md](NOTICE.md)。
 
+本仓库为 [zmjjcjb/droid-baton](https://github.com/zmjjcjb/droid-baton)。不是 Factory 或 OpenAI 的官方集成。
+
 ## 长期任务监督
 
 0.2 已加入同一目标的多轮续做、后台工作跟踪、失败检查后的有限修复、停滞/预算提醒和 Codex 审查接收。长期任务设置 `supervision: true`；需要终端可设置 `terminal: true`。完整流程、参数与边界见 [长期任务说明](docs/LONG_TASKS.md)。
@@ -108,7 +110,7 @@ MCP 与面板连接同一个独立任务服务。MCP 重启时任务继续；服
 
 更新后先等待任务结束，再执行 `node src/cli.mjs stop`，下次调用自动启动新服务。保留 Baton 的 stdio 热更新外壳，但运行中的 broker 不做无缝热替换。
 
-卸载执行 `node src/cli.mjs setup --remove` 和 `node src/cli.mjs stop`。运行记录及 Droid 原生会话保留。尚未发布 npm/GitHub，没有开机自启或计划任务。
+卸载执行 `node src/cli.mjs setup --remove` 和 `node src/cli.mjs stop`。运行记录及 Droid 原生会话保留。尚未发布 npm 包，没有开机自启或计划任务。
 
 ## 差距与验证
 
