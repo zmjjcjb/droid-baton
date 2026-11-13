@@ -10,13 +10,13 @@ export function supervisionOptions(value) {
   if (value === undefined || value === false) return null
   if (value !== true && (!value || typeof value !== 'object' || Array.isArray(value))) throw new Error('supervision 必须是 true/false 或监督配置对象。')
   const v = value === true ? {} : value
-  const defaults = { interval_s: 300, stall_s: 900, max_rounds: 12, max_repairs: 2, max_tokens: 0, auto_continue: true, require_review: true }
+  const defaults = { interval_s: 300, stall_s: 900, max_rounds: 12, max_repairs: 2, max_tokens: 0, auto_continue: true, require_review: true, notify_progress: false }
   if (Object.keys(v).some(k => !(k in defaults))) throw new Error('未知 supervision 配置项。')
   const result = { ...defaults, ...v }
   for (const [key, min, max] of [['interval_s', 10, 86400], ['stall_s', 10, 86400], ['max_rounds', 1, 50], ['max_repairs', 0, 10], ['max_tokens', 0, 100000000]]) {
     if (!Number.isInteger(result[key]) || result[key] < min || result[key] > max) throw new Error(`supervision.${key} 必须在 ${min}–${max} 之间。`)
   }
-  for (const key of ['auto_continue', 'require_review']) if (typeof result[key] !== 'boolean') throw new Error(`supervision.${key} 必须是布尔值。`)
+  for (const key of ['auto_continue', 'require_review', 'notify_progress']) if (typeof result[key] !== 'boolean') throw new Error(`supervision.${key} 必须是布尔值。`)
   return result
 }
 
@@ -170,7 +170,8 @@ export class Supervisor {
   }
   initialize(r) {
     if (!r.supervision) return
-    r.supervisor = { round: 0, repairs: 0, total_tokens: 0, history: [], last_notice_ms: Date.now(), checks_serial: 0 }
+    const time = Date.now()
+    r.supervisor = { round: 0, repairs: 0, total_tokens: 0, history: [], last_notice_ms: time, last_scan_ms: time, checks_serial: 0 }
   }
   beginTurn(r, kind) {
     r.turn_open = true; r.native_round_open = false; r.native_busy = false; r.turn_started_ms = Date.now(); r.attention = null; r.checkpoint = null
@@ -201,28 +202,41 @@ export class Supervisor {
         for (const job of Object.values(r.work.jobs)) if (job.id === worker.id || job.tool_id === worker.tool_id) job.status = worker.status
         ended = true; b.event(r, 'native_child_ended', { child_id: worker.id, reason: outcome.reason })
       }
-      if (ended) r.work_quiet_since = Date.now()
+      if (ended) {
+        r.work_quiet_since = Date.now()
+        if (r.activity) r.activity.last_progress_ms = time
+      }
       if (r.state === 'background') await this.settle(b.getSession(r.session_id), r)
       if (!r.supervision || r.attention || finished(r.state) || ['review', 'checking'].includes(r.state)) continue
-      const cfg = r.supervision, a = r.activity || {}
-      const stalled = time - (a.last_progress_ms || r.turn_started_ms) >= cfg.stall_s * 1000
-      const due = time - r.supervisor.last_notice_ms >= cfg.interval_s * 1000
-      if (time - r.supervisor.last_notice_ms < Math.min(cfg.interval_s, cfg.stall_s) * 1000) continue
-      if (!stalled && !due) continue
-      // Scan files only when due, not every timer tick. A daemon heartbeat alone
-      // never resets the semantic-progress clock.
-      r.file_progress = evidence.changedSince(r.cwd, r.supervisor.last_notice_ms, { max: 10 })
+      const cfg = r.supervision, supervisor = r.supervisor, a = r.activity || {}
+      const lastScan = supervisor.last_scan_ms ?? supervisor.last_notice_ms
+      const lastProgress = Math.max(a.last_progress_ms || 0, r.turn_started_ms || 0)
+      const stalled = time - lastProgress >= cfg.stall_s * 1000
+      const newStall = stalled && lastProgress !== supervisor.acknowledged_stall_progress_ms
+      const scanSince = cfg.notify_progress ? Math.max(lastScan, supervisor.last_notice_ms) : lastScan
+      const due = time - scanSince >= cfg.interval_s * 1000
+      if (!newStall && !due) continue
+      // An overdue stall gets a file scan before it can wake a waiting client.
+      supervisor.last_scan_ms = time
+      r.file_progress = evidence.changedSince(r.cwd, lastScan, { max: 10 })
       if (r.file_progress?.count) { a.last_progress_ms = time; a.progress_events = (a.progress_events || 0) + 1 }
-      const noProgress = stalled && !r.file_progress?.count
-      // Name the suspected cause rather than only reporting silence: a repeated
-      // tool call is a stuck worker, a missing last tool is a dead one.
+      // Repeated tool calls are a hint for review, not evidence of a stall.
       const diagnosis = []
       if ((a.repeated || 0) >= 3) diagnosis.push(`同一工具调用已连续重复 ${a.repeated} 次，可能原地打转`)
       if (a.last_tool) diagnosis.push(`最后工具：${a.last_tool}`)
       else diagnosis.push('尚未观察到任何工具调用')
       if (r.file_progress?.count) diagnosis.push(`最近有 ${r.file_progress.count} 个文件变化`)
       const suffix = diagnosis.length ? `（${diagnosis.join('；')}）` : ''
-      this.attention(r, noProgress ? 'stalled' : 'checkpoint', noProgress ? `一段时间没有内容、工具或文件进展；可能是慢任务，也可能卡住。请结合最后工具、心跳和后台工作决定继续等待或纠偏。${suffix}` : `到达监督检查点；请查看摘要。正常则 watch，跑偏则发送纠偏指令。${suffix}`)
+      if (newStall && !r.file_progress?.count) {
+        supervisor.stalled_progress_ms = lastProgress
+        this.attention(r, 'stalled', `一段时间没有内容、工具或文件进展；可能是慢任务，也可能卡住。请判断是否继续等待或纠偏。${suffix}`)
+      } else {
+        const text = `第 ${supervisor.round} 轮本地巡检${suffix}`
+        b.event(r, 'supervision_checkpoint', { text, round: supervisor.round })
+        if (cfg.notify_progress && time - supervisor.last_notice_ms >= cfg.interval_s * 1000) {
+          this.attention(r, 'checkpoint', text)
+        }
+      }
     }
   }
   async ended(s, r, n) {
@@ -241,7 +255,7 @@ export class Supervisor {
     if (finished(r.state) || r.turn_open || this.checking.has(r.run_id) || ['paused', 'waiting'].includes(r.state)) return
     const pending = liveWork(r)
     if (pending.active) {
-      r.state = 'background'; this.broker.changed()
+      if (r.state !== 'background') { r.state = 'background'; this.broker.changed() }
       if (pending.mission && ['paused', 'awaiting_input'].includes(pending.mission.state)) this.attention(r, 'mission_waiting', `原生 Mission 处于 ${pending.mission.state}，目标尚未完成。`)
       // No fabricated Task completion. Let Droid collect TaskOutput in a bounded
       // next round when no Mission/worker event can settle the result for us.
@@ -290,20 +304,21 @@ export class Supervisor {
     writeJson(copy, { ...rec, result: undefined, checks: r.checks })
     fs.copyFileSync(before, copy.replace(/\.json$/, '.before.json'))
     r.evidence = await b.collect(r, { evidenceId: id })
+    if (r.evidence) r.evidence_record = copy
     r.evidence_at = now(); r.evidence_turn_id = r.last_completed_turn_id || r.turn_id
     return r.evidence
   }
   async continue(s, r, message, kind) {
     if (finished(r.state) || r.state === 'paused') return
-    if (!r.supervision.auto_continue) return this.attention(r, 'continue_required', message, 'review')
     if (r.supervisor.round >= r.supervision.max_rounds) return this.attention(r, 'round_budget', '达到自动执行轮次上限；目标未被认定完成。', 'review')
     if (r.supervision.max_tokens && r.supervisor.total_tokens >= r.supervision.max_tokens) return this.attention(r, 'token_budget', '达到 Token 预算，已停止自动续做。', 'review')
+    if (!r.supervision.auto_continue) return this.attention(r, 'continue_required', message, 'review')
     r.state = 'running'
     return await this.broker.dispatchTurn(s, r, message, kind)
   }
   async control(a) {
     const b = this.broker, r = b.getRun(a.run_id), s = b.getSession(r.session_id)
-    const detail = a.detail === 'summary' ? 'summary' : 'full'
+    const { detail = 'full' } = a
     if (!r.supervision) {
       if (r.state === 'background' && a.action === 'continue' && a.message?.trim() && a.reason?.trim()) {
         r.attention = null; await b.dispatchTurn(s, r, a.message, 'collect_background'); return b.status({ run_id: r.run_id, detail })
@@ -318,6 +333,7 @@ export class Supervisor {
     if (['accept', 'continue', 'resume'].includes(a.action) && !a.reason?.trim()) throw new Error('需要 reason 记录主控的判断依据。')
     if (a.action === 'watch') {
       if (['review', 'paused'].includes(r.state)) throw new Error('任务当前没有执行中的轮次；请明确 continue/accept/resume。')
+      if (r.attention?.kind === 'stalled') r.supervisor.acknowledged_stall_progress_ms = r.supervisor.stalled_progress_ms
       r.attention = null; r.supervisor.last_notice_ms = Date.now(); this.broker.changed()
     } else if (a.action === 'pause') {
       r.state = 'paused'; r.turn_open = false; r.attention = null

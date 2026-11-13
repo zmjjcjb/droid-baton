@@ -1,6 +1,6 @@
 {
   "name": "droid-baton-mcp",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "A Baton-derived local MCP bridge from Codex to Factory Droid, with live supervision and independent evidence.",
   "type": "module",
   "private": true,

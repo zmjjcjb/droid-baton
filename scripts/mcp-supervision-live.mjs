@@ -22,7 +22,8 @@ try {
     const r = await tool('droid_wait', { run_id: run.run_id, timeout_s: 50 })
     if (r.timed_out) continue
     if (r.attention?.kind === 'checkpoint' || r.attention?.kind === 'stalled') { await tool('droid_supervise', { run_id: run.run_id, action: 'watch', attention_id: r.attention.id }); continue }
-    assert.equal(r.attention?.kind, 'ready_for_review'); assert.equal(r.evidence.all_checks_passed, true); assert.match(r.final_text, /SUPERVISION_MCP_READY/)
+    assert.equal(r.attention?.kind, 'ready_for_review'); assert.equal(r.evidence.all_checks_passed, true); assert.match(r.checkpoint.summary, /只读联调完成/)
+    assert.match((await tool('droid_status', { run_id: run.run_id })).final_text, /SUPERVISION_MCP_READY/)
     done = await tool('droid_supervise', { run_id: run.run_id, action: 'accept', attention_id: r.attention.id, reason: 'MCP 联调主控已核对只读目标输出、空文件变化和真实检查结果。' }); break
   }
   assert.equal(done?.state, 'completed')

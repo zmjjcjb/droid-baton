@@ -2,13 +2,13 @@
 
 以 [dsh-baton 0.6.11](https://github.com/JialaoLiu/dsh-baton/tree/27856b463a7344952da32263719acb6ae97f8bef) 为模板，让 **Codex 规划和验收，Factory Droid 执行**。保留派发、续聊、队列、补充、等待、问答、取消和独立证据链。无需 npm 依赖。
 
-当前版本 0.2.1，已在 Linux、Node 22.23.4、Droid 0.240.0 验证。保留原 MIT 许可证与署名，派生关系见 [NOTICE.md](NOTICE.md)。
+当前版本 0.2.2，验证环境为 Linux、Node 22.23.4、Droid 0.240.0。保留原 MIT 许可证与署名，派生关系见 [NOTICE.md](NOTICE.md)。
 
 本仓库为 [zmjjcjb/droid-baton](https://github.com/zmjjcjb/droid-baton)。不是 Factory 或 OpenAI 的官方集成。
 
 ## 长期任务监督
 
-0.2 已加入同一目标的多轮续做、后台工作跟踪、失败检查后的有限修复、停滞/预算提醒和 Codex 审查接收。长期任务设置 `supervision: true`；需要终端可设置 `terminal: true`。完整流程、参数与边界见 [长期任务说明](docs/LONG_TASKS.md)。
+长期任务设置 `supervision: true`，在同一运行内有界续做、跟踪后台工作并独立验收。默认由本地服务巡检。提问、需要决定的异常和最终验收才返回 Codex。需要实时看进度可设置 `terminal: true`。完整参数见 [长期任务说明](docs/LONG_TASKS.md)。
 
 ## 开始使用
 
@@ -44,7 +44,7 @@ node src/cli.mjs dashboard --open
 | `droid_list_models` | Droid 实际可选模型，不返回凭据 |
 | `droid_send` | 新建、续聊、followup 排队或 steer 补充 |
 | `droid_status` | 一次查看状态、事件、问题、回复、用量和证据（默认精简视图） |
-| `droid_wait` | 等待单个任务或多个任务中任一个结束/提问（默认精简视图） |
+| `droid_wait` | 等待一个或多个任务结束、提问或请求监督决定 |
 | `droid_answer` | 回答问题、选择列表，或批准/拒绝单次权限请求 |
 | `droid_supervise` | 处理长期目标监督通知，纠偏、暂停/恢复及审查接收 |
 | `droid_cancel` | 停止运行及所属工具进程树，不自动重试 |
@@ -71,20 +71,17 @@ starting → running → waiting（提问/权限）→ running → checking → 
 - 每条检查最多 120 秒，总检查预算 180 秒。检查在单独受管进程组内执行，可响应取消。命令须在用户授权范围内。
 - 默认阻止不同会话同时修改相同/嵌套目录；并发用独立目录/工作树。显式 `allow_shared_cwd` 放开后证据可能串入其他运行的修改。
 
-wait 使用事件等待，Codex MCP 默认单次 3540 秒、其他客户端及 CLI 每次连接默认 50 秒；完成、提问或监督通知提前返回。超时只结束本次等待。注册的 Codex 工具超时为 3600 秒。取消 MCP 等待或退出 Codex 不会自动停止 Droid；停止工作须显式 cancel。面板每 1.5 秒读取本地状态，不调用模型。
+Codex 的 `droid_wait` 默认单次 3540 秒，其他 MCP 客户端默认 50 秒。CLI `wait` 在进程内继续等待，直到有终态或待处理事件。等待超时或取消时，Droid 继续执行。显式 cancel 停止工作。面板每 1.5 秒读取本地状态，无需调用模型。
 
 ## 上下文开销
 
-`droid_status` 和 `droid_wait` 默认返回精简视图，而不是 Droid 的完整记录。完整记录里 `work.tools` 保留最近 100 次工具调用的全部输入、`recent_events` 保留 30 条事件的完整载荷，单次序列化可达 200 KB 以上；监督者对同一个运行轮询几十次，这些字节会被反复计入上下文。
+派发后用一次 `droid_wait` 等待，多任务合用 `run_ids`。每次处理完终态就移除相应 ID。暂时保留待处理通知时，可用 `after_attention` 记录已收到的通知 ID，等待该运行的新通知或其他运行的结果。
 
-精简视图只保留监督者真正据以决策的内容：状态与计数、未结束的后台工作、最近 12 条事件的一行摘要、待答问题和验收结论。实测同一运行 **218.9 KB → 12.7 KB（减少 94%）**。
+- `droid_send`、`droid_wait`、`droid_supervise`、`droid_answer` 和 `droid_cancel` 默认使用 `detail: "decision"`，返回状态、待答请求、完成报告和检查结果等当前所需的信息。
+- `droid_status` 默认使用 `detail: "summary"`，供按需查看进度与近期事件。传入 `since_seq` 可筛选更新的近期事件。
+- `detail: "full"` 读取完整运行状态；需要原始工具记录时可读 `~/.droid-baton/events/<run_id>.jsonl`，需要完整验收记录时可读 `evidence_record`。
 
-- `detail`：`summary`（默认）或 `full`。`full` 保留历史完整形状，供面板、CLI 和需要逐条证据的调用使用。
-- `since_seq`：只返回 `seq` 大于该值的新事件。传上次返回的 `last_seq` 即可增量轮询，无新事件时返回几乎为零字节。
-- 精简视图会报告被折叠的数量（`tools_not_shown`、`events_not_shown`），不会静默丢内容。
-- 原始记录始终保留在 `~/.droid-baton/events/<run_id>.jsonl`，每条带单调递增的 `seq`。
-
-监督者还应避免重复读取 Droid 正在修改的文件或运行它正在运行的命令。重复检测会在停滞通知中给出诊断：同一工具调用连续重复 3 次以上即提示可能原地打转，并附上最后使用的工具。
+交接长任务时，把任务文件路径、执行范围、预算和验收命令一次给 Droid。预检、实施、运行和可自动判断的验收由 Droid 与本地服务处理。Codex 处理确需主控的决定并核查最终证据。
 
 问题回答须附当前 `request_id`，过期/重复回答会被拒绝。权限只支持本次批准 `proceed_once` 和拒绝 `cancel`，不通过任务桥写永久授权。
 

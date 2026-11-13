@@ -140,7 +140,7 @@ export class Broker extends EventEmitter {
       busy.steers = [...(busy.steers || []), { message_id: id, message: a.message, sender: a.sender || 'codex', time: now() }]
       this.event(busy, 'steer', busy.steers.at(-1)); this.changed()
       conn.request('droid.add_user_message', { messageId: id, text: `[由 ${a.sender || 'Codex'} 从另一聊天补充]\n${a.message}`, queuePlacement: 'end_of_loop' }, { timeout: 0 }).catch(error => { this.event(busy, 'steer_error', { text: error.message }) })
-      return { ...this.status({ run_id: busy.run_id }), mode: 'steer', delivery: 'end_of_loop', note: '补充指令会在 Droid 当前工具循环结束时送达；不会强行打断正在运行的命令。' }
+      return { ...this.status({ run_id: busy.run_id, detail: a.detail }), mode: 'steer', delivery: 'end_of_loop', note: '补充指令会在 Droid 当前工具循环结束时送达；不会强行打断正在运行的命令。' }
     }
     if (this.opening.has(cwd)) throw new Error('该目录的会话正在初始化，请稍后重试。')
     // Sessions sharing a tree can corrupt each other's edits and evidence. Queue the same
@@ -166,7 +166,7 @@ export class Broker extends EventEmitter {
     if (active(this.state.runs[s.active_run])) { r.state = 'queued'; s.queue.push(r.run_id) }
     else { s.active_run = r.run_id; void this.start(s, r) }
     this.changed()
-    return this.status({ run_id: r.run_id })
+    return this.status({ run_id: r.run_id, detail: a.detail })
   }
   async start(s, r) {
     try {
@@ -271,7 +271,10 @@ export class Broker extends EventEmitter {
     if (state !== 'completed') this.supervisor.stopOwned(r)
     if (r.started_at && !evidenceReady && !['cancelled', 'interrupted'].includes(state)) {
       r.state = 'checking'; this.changed()
-      try { r.evidence = await this.collect(r) } catch (err) { r.evidence_error = err.message; state = 'failed' }
+      try {
+        r.evidence = await this.collect(r)
+        if (r.evidence) r.evidence_record = path.join(this.home, 'evidence', `${r.run_id}.json`)
+      } catch (err) { r.evidence_error = err.message; state = 'failed' }
     }
     // cancel() can win while the independent checks run.
     if (TERMINAL.has(r.state)) return
@@ -306,7 +309,7 @@ export class Broker extends EventEmitter {
     const flags = {
       needs_input: r.state === 'waiting',
       needs_attention: !!r.attention && !TERMINAL.has(r.state),
-      ...(r.state === 'completed' ? { review_hint: '依据 evidence 中的真实检查结果验收；检查失败或缺少覆盖时继续同一会话修复。不要仅凭 Droid 的完成表判定通过；按风险审查 diff。' } : {}),
+      ...(r.state === 'completed' && detail !== 'decision' ? { review_hint: '依据 evidence 中的真实检查结果验收；检查失败或缺少覆盖时继续同一会话修复。不要仅凭 Droid 的完成表判定通过；按风险审查 diff。' } : {}),
     }
     // `full` is the historical shape: every field, for the dashboard, the CLI and
     // internal callers. `summary` is the compact supervisor view — a poll costs a
@@ -316,9 +319,10 @@ export class Broker extends EventEmitter {
       const { checks, ...out } = clean(r)
       return { ...out, ...flags, outstanding_work: liveWork(r), ...(r.state === 'waiting' ? { question: r.pending } : {}) }
     }
+    if (detail === 'decision') return { ...projectRun(r, { detail }), ...flags }
     return { ...projectRun(r, { since_seq, detail }), ...flags, ...(r.state === 'waiting' ? { question: projectPending(r.pending) } : {}) }
   }
-  async answer({ run_id, request_id, answers, selected_option, reason, cancelled = false, selected_ids }) {
+  async answer({ run_id, request_id, answers, selected_option, reason, cancelled = false, selected_ids, detail = 'full' }) {
     const r = this.getRun(run_id), p = r.pending
     if (r.state !== 'waiting' || !p) throw new Error('该运行当前没有待回答的问题。')
     if (request_id !== p.request_id) throw new Error('request_id 已过期或不匹配；请读取当前问题。')
@@ -345,14 +349,14 @@ export class Broker extends EventEmitter {
     if (r.pending !== p) throw new Error('该问题已被另一客户端回答。')
     conn.answer(p.request_id, result); r.pending = null; r.state = 'running'
     this.event(r, 'answered', { kind: p.kind, result, reason }); this.changed()
-    return this.status({ run_id })
+    return this.status({ run_id, detail })
   }
-  async cancel({ run_id, session_id, reason = '用户取消。', timeout = false }) {
+  async cancel({ run_id, session_id, reason = '用户取消。', timeout = false, detail = 'full' }) {
     const s = this.getSession(session_id || this.getRun(run_id).session_id)
     const r = this.state.runs[run_id || s.active_run]
-    if (r && TERMINAL.has(r.state)) return this.status({ run_id: r.run_id })
+    if (r && TERMINAL.has(r.state)) return this.status({ run_id: r.run_id, detail })
     if (r?.state === 'queued' && !session_id) {
-      s.queue = s.queue.filter(id => id !== r.run_id); r.state = 'cancelled'; r.ended_at = now(); r.error = reason; this.changed(); return this.status({ run_id })
+      s.queue = s.queue.filter(id => id !== r.run_id); r.state = 'cancelled'; r.ended_at = now(); r.error = reason; this.changed(); return this.status({ run_id, detail })
     }
     for (const id of s.queue.splice(0)) { const q = this.getRun(id); q.state = 'cancelled'; q.ended_at = now(); q.error = reason }
     if (r) {
@@ -372,22 +376,35 @@ export class Broker extends EventEmitter {
         conn.close()
       }
     }
-    this.changed(); return r ? this.status({ run_id: r.run_id }) : { session_id: s.session_id, state: 'idle' }
+    this.changed(); return r ? this.status({ run_id: r.run_id, detail }) : { session_id: s.session_id, state: 'idle' }
   }
-  async wait({ run_id, run_ids, session_id, timeout_s = 50, detail = 'full', since_seq = -1 }, signal) {
+  async wait({ run_id, run_ids, session_id, timeout_s = 50, detail = 'full', since_seq = -1, after_attention = {} }, signal) {
     const ids = run_ids || [run_id || this.getSession(session_id).active_run]
     if (!Array.isArray(ids) || !ids.length || ids.length > 64 || ids.some(id => !this.state.runs[id])) throw new Error('请提供 1–64 个有效 run_id。')
+    if (!after_attention || typeof after_attention !== 'object' || Array.isArray(after_attention) || Object.values(after_attention).some(id => typeof id !== 'string')) throw new Error('after_attention 必须是从 run_id 到通知 ID 的映射。')
+    const runs = ids.map(id => this.getRun(id))
+    const brief = ({ run_id, session_id, state }) => ({ run_id, session_id, state })
+    const ready = r => {
+      if (TERMINAL.has(r.state)) return true
+      if (r.state === 'waiting' && r.pending) return after_attention[r.run_id] !== r.pending.request_id
+      return !!r.attention && after_attention[r.run_id] !== r.attention.id
+    }
     const seconds = Math.min(Math.max(Number(timeout_s) || 50, 1), 3540)
     return await new Promise(resolve => {
       let timer, settled = false
       const done = timed_out => {
         if (settled) return; settled = true
         clearTimeout(timer); this.off('change', check); signal?.removeEventListener('abort', abort)
-        const results = ids.map(id => this.status({ run_id: id, detail, since_seq }))
-        const ended = results.filter(r => TERMINAL.has(r.state) || r.needs_input || r.needs_attention)
-        resolve(run_ids ? { ended, still_running: results.filter(r => !ended.includes(r)).map(r => ({ run_id: r.run_id, session_id: r.session_id, state: r.state })), timed_out } : { ...results[0], timed_out })
+        const ended = runs.filter(ready).map(r => this.status({ run_id: r.run_id, detail, since_seq }))
+        if (run_ids) {
+          resolve({ ended, still_running: runs.filter(r => !ready(r)).map(brief), timed_out })
+        } else {
+          const run = runs[0]
+          const status = ended[0] ?? (detail === 'decision' ? brief(run) : this.status({ run_id: run.run_id, detail, since_seq }))
+          resolve({ ...status, timed_out })
+        }
       }
-      const check = () => { if (ids.some(id => TERMINAL.has(this.getRun(id).state) || this.getRun(id).state === 'waiting' || this.getRun(id).attention)) done(false) }
+      const check = () => { if (runs.some(ready)) done(false) }
       const abort = () => done(true)
       this.on('change', check); signal?.addEventListener('abort', abort, { once: true })
       timer = setTimeout(() => done(true), seconds * 1000)

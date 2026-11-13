@@ -85,6 +85,24 @@ test('evidence keeps pass/fail verdicts and the changed-file list', () => {
   assert.deepEqual(view.changes.created, [{ path: 'a.txt' }])
   assert.ok(view.checks[0].output_tail.length < 700)
 })
+test('decision evidence caps file lists and reports full counts and check verdicts', () => {
+  const run = { state: 'review', evidence: {
+    all_checks_passed: false,
+    checks: [{ command: 'check_a', exit_code: 0, passed: true, output_tail: 'verbose output' },
+      { command: 'check_b', exit_code: null, passed: false, timed_out: true, output_tail: 'x'.repeat(400) + 'TAIL' }],
+    changes: { deleted: Array.from({ length: 8 }, (_, i) => `f${i}`), truncated: true },
+  } }
+  const view = projectRun(run, { detail: 'decision' }).evidence
+  assert.equal(view.checks[0].passed, true)
+  assert.equal(view.checks[0].output_tail, undefined)
+  assert.equal(view.checks[1].passed, false)
+  assert.equal(view.checks[1].timed_out, true)
+  assert.equal(view.checks[1].output_tail.length, 250)
+  assert.match(view.checks[1].output_tail, /TAIL$/)
+  assert.deepEqual(view.changes.deleted, ['f0', 'f1', 'f2', 'f3', 'f4'])
+  assert.equal(view.changes.counts.deleted, 8)
+  assert.equal(view.changes.truncated, true)
+})
 
 test('the broker serves a compact status by default over MCP and keeps the full shape on request', async t => {
   const { b, cwd } = await context(t)
@@ -148,7 +166,7 @@ test('a stalled run names the suspected cause in the supervisor notice', async t
   for (let i = 0; i < 100 && b.getRun(r.run_id).state !== 'running'; i++) await sleep(10)
   const run = b.getRun(r.run_id)
   for (let i = 0; i < 3; i++) observeWork(run, { type: 'tool_call', toolUse: { id: `y${i}`, name: 'Execute', input: { command: 'ls' } } })
-  const now = Date.now(); run.activity.last_progress_ms = now - 60000; run.supervisor.last_notice_ms = now - 30000
+  const now = Date.now(); run.activity.last_progress_ms = now - 60000; run.turn_started_ms = now - 60000; run.supervisor.last_scan_ms = now - 30000
   await b.supervisor.tick(now)
   const notice = await b.wait({ run_id: r.run_id, timeout_s: 1 })
   assert.equal(notice.attention.kind, 'stalled')

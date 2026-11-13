@@ -40,7 +40,10 @@ try {
     print(await call('send', { message: pos.slice(1).join(' '), ...(v.cwd ? { cwd: v.cwd } : {}), ...(v.session ? { session_id: v.session } : {}), ...(v.mode ? { mode: v.mode } : {}), ...(v.model ? { model: v.model } : {}), ...(v.autonomy ? { autonomy: v.autonomy } : {}), ...(v.timeout ? { timeout_s: Number(v.timeout) } : {}), ...(v.supervise ? { supervision: true } : {}), checks: v.check || [] }))
   } else if (cmd === 'wait') {
     let result
-    for (;;) { result = await call('wait', { run_id: pos[1], timeout_s: 50 }); if (!result.timed_out) break }
+    for (;;) {
+      result = await call('wait', { run_id: pos[1], timeout_s: 3540 })
+      if (!result.timed_out) break
+    }
     print(result)
     if (['failed', 'cancelled', 'interrupted'].includes(result.state) || result.evidence?.all_checks_passed === false) process.exitCode = 1
     else if (result.needs_input) process.exitCode = 2
@@ -56,7 +59,7 @@ try {
         if (r.state !== state) { process.stdout.write(`\n[${r.state}] ${r.supervisor ? `第 ${r.supervisor.round} 轮` : ''}\n`); state = r.state }
         for (const e of r.recent_events || []) if ((e.seq || 0) > seq) {
           seq = e.seq
-          if (e.type !== 'assistant') process.stdout.write(plain(`${e.time.slice(11, 19)} ${e.name || e.type} ${e.input || e.error || ''}`) + '\n')
+          if (e.type !== 'assistant') process.stdout.write(plain(`${e.time.slice(11, 19)} ${e.name || e.type} ${e.input || e.error || e.text || ''}`) + '\n')
         }
         const next = r.partial_text || r.final_text || ''
         if (next !== text) { process.stdout.write(plain(next.startsWith(text) ? next.slice(text.length) : '\n' + next)); text = next }

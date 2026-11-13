@@ -93,6 +93,7 @@ test('heartbeat is liveness only; stall notification wakes wait and acknowledgem
   const r = await b.send({ cwd, message: 'MOCK:GOAL_WAIT', supervision: { interval_s: 10, stall_s: 10 } })
   const goal = await state(b, r.run_id, 'running')
   const now = Date.now(); goal.activity.last_progress_ms = now - 60000; goal.supervisor.last_notice_ms = now - 30000
+  goal.turn_started_ms = now - 60000
   observeWork(goal, { type: 'mission_heartbeat' }, now)
   assert.equal(goal.activity.last_progress_ms, now - 60000)
   await b.supervisor.tick(now)
@@ -100,7 +101,9 @@ test('heartbeat is liveness only; stall notification wakes wait and acknowledgem
   assert.equal(notice.attention.kind, 'stalled'); assert.equal(notice.state, 'running')
   await assert.rejects(b.call('supervise', { run_id: r.run_id, action: 'watch', attention_id: 'stale' }), /过期/)
   await b.call('supervise', { run_id: r.run_id, action: 'watch', attention_id: notice.attention.id })
-  await b.supervisor.tick(Date.now() + 1000); assert.equal(goal.attention, null)
+  await b.supervisor.tick(now + 12000); assert.equal(goal.attention, null)
+  observeWork(goal, { type: 'assistant_text_delta' }, now + 12001)
+  await b.supervisor.tick(now + 25000); assert.equal(goal.attention.kind, 'stalled')
 })
 test('missing report and unchecked completion require real main-agent decision', async t => {
   const { b, cwd, root } = await context(t)
@@ -195,14 +198,30 @@ test('native background completion cannot bypass the overall round budget', asyn
   const job = Object.values(paused.work.jobs).find(j => j.identity)
   await sleep(30); assert.equal(processAlive(job.identity), false)
 })
-test('supervision interval spans continuation rounds instead of being postponed by every turn', async t => {
+test('periodic scans span rounds without waking a default wait', async t => {
   const { b, cwd } = await context(t)
   const r = await b.send({ cwd, message: 'MOCK:GOAL_WAIT', supervision: { interval_s: 10, stall_s: 60 } })
   const goal = await state(b, r.run_id, 'running')
-  goal.supervisor.last_notice_ms = Date.now() - 11000
-  const previous = goal.supervisor.last_notice_ms
+  goal.supervisor.last_scan_ms = Date.now() - 11000
+  const previous = goal.supervisor.last_scan_ms
   b.supervisor.beginTurn(goal, 'continuation')
-  assert.equal(goal.supervisor.last_notice_ms, previous)
-  await b.supervisor.tick()
-  assert.equal(goal.attention.kind, 'checkpoint')
+  assert.equal(goal.supervisor.last_scan_ms, previous)
+  const waiting = b.wait({ run_id: r.run_id, timeout_s: 1, detail: 'decision' })
+  const now = Date.now()
+  await b.supervisor.tick(now)
+  await b.supervisor.tick(now + 11000)
+  assert.equal(goal.recent_events.filter(e => e.type === 'supervision_checkpoint').length, 2)
+  assert.equal(goal.attention, null)
+  assert.deepEqual(await waiting, { run_id: r.run_id, session_id: r.session_id, state: 'running', timed_out: true })
+
+  // An explicit opt-in keeps the previous interruptible checkpoint workflow.
+  goal.supervision.notify_progress = true
+  await b.supervisor.tick(now + 22000)
+  const notice = await b.wait({ run_id: r.run_id, timeout_s: 1 })
+  assert.equal(notice.attention.kind, 'checkpoint')
+  const waitingForAnother = b.wait({ run_ids: [r.run_id], after_attention: { [r.run_id]: notice.attention.id }, timeout_s: 5, detail: 'decision' })
+  await b.cancel({ run_id: r.run_id })
+  const result = await waitingForAnother
+  assert.equal(result.ended[0].state, 'cancelled')
+  assert.equal(result.timed_out, false)
 })

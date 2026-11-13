@@ -1,3 +1,5 @@
+import { liveWork } from './supervision.mjs'
+
 // Compact projections of a run for the supervisor (Codex).
 //
 // A raw run carries everything Droid ever did: `work.tools` keeps up to 100 tool
@@ -108,6 +110,7 @@ export function projectWork(work = {}) {
  */
 export function projectRun(run, { since_seq = -1, detail = 'summary' } = {}) {
   if (detail === 'full') return run
+  if (detail === 'decision') return projectDecision(run)
   const events = projectEvents(run?.recent_events || [], { since_seq })
   const work = projectWork(run?.work || {})
   return {
@@ -128,7 +131,7 @@ export function projectRun(run, { since_seq = -1, detail = 'summary' } = {}) {
     ...(run?.final_text ? { final_text: clip(run.final_text, LIMITS.finalText) } : {}),
     ...(run?.partial_text ? { partial_text: clip(run.partial_text, LIMITS.finalText) } : {}),
     ...(run?.attention ? { attention: { ...run.attention, message: oneLine(run.attention.message, LIMITS.eventText) } } : {}),
-    ...(run?.pending ? { pending: projectPending(run.pending) } : {}),
+    ...(run?.state === 'waiting' && run.pending ? { pending: run.pending } : {}),
     ...(run?.supervisor ? { supervisor: { round: run.supervisor.round, repairs: run.supervisor.repairs, total_tokens: run.supervisor.total_tokens, ...(run.supervisor.current_kind ? { current_kind: run.supervisor.current_kind } : {}) } } : {}),
     ...(run?.checks?.length ? { checks: run.checks } : {}),
     ...(run?.supervision ? { supervision: { interval_s: run.supervision.interval_s, stall_s: run.supervision.stall_s, max_rounds: run.supervision.max_rounds, max_repairs: run.supervision.max_repairs } } : {}),
@@ -141,7 +144,38 @@ export function projectRun(run, { since_seq = -1, detail = 'summary' } = {}) {
     last_seq: events.last_seq,
     ...(events.events_not_shown ? { events_not_shown: events.events_not_shown } : {}),
     ...(run?.evidence ? { evidence: projectEvidence(run.evidence) } : {}),
+    ...(run?.evidence_record ? { evidence_record: run.evidence_record } : {}),
     ...(run?.acceptance ? { acceptance: run.acceptance } : {}),
+  }
+}
+
+// A long wait delivers only what can change the supervisor's next action.
+export function projectDecision(run) {
+  const { run_id, session_id, state, cwd, model, event_seq } = run
+  const attention = run.attention
+  const stalled = attention?.kind === 'stalled'
+  const work = stalled || state === 'background' ? liveWork(run) : null
+  const supervisor = run.supervisor
+  return {
+    run_id, session_id, state, cwd, model, last_seq: event_seq || 0,
+    ...(run.error ? { error: clip(run.error, 1000) } : {}),
+    ...(run.evidence_error ? { evidence_error: clip(run.evidence_error, 1000) } : {}),
+    ...(attention ? { attention: { ...attention, message: clip(attention.message, 1200) } } : {}),
+    // Keep the actual request so a permission decision has the command/scope,
+    // and a question has all options and selection constraints.
+    ...(state === 'waiting' && run.pending ? { pending: run.pending } : {}),
+    ...(supervisor ? { supervisor: { round: supervisor.round, repairs: supervisor.repairs, total_tokens: supervisor.total_tokens } } : {}),
+    ...(run.checkpoint ? { checkpoint: projectCheckpoint(run.checkpoint, { maxRemaining: 5, summaryChars: 1600 }) } : run.final_text ? { final_text: clip(run.final_text, 1600) } : {}),
+    ...(stalled ? { activity: { last_progress_ms: run.activity?.last_progress_ms, last_tool: run.activity?.last_tool, repeated: run.activity?.repeated } } : {}),
+    ...(work ? { outstanding_work: {
+      jobs: work.jobs.slice(0, 3).map(({ id, source, status, pid }) => ({ id, source, status, pid })),
+      workers: work.workers.slice(0, 3).map(({ id, status }) => ({ id, status })),
+      counts: { jobs: work.jobs.length, workers: work.workers.length },
+      mission_state: work.mission?.state,
+    } } : {}),
+    ...(run.evidence ? { evidence: projectEvidence(run.evidence, { maxFiles: 5 }) } : {}),
+    ...(run.evidence_record ? { evidence_record: run.evidence_record } : {}),
+    ...(run.acceptance ? { acceptance: { ...run.acceptance, reason: clip(run.acceptance.reason, 400) } } : {}),
   }
 }
 
@@ -158,12 +192,13 @@ export function projectPending(pending) {
 }
 
 /** The structured goal report a supervised round produced. */
-export function projectCheckpoint(checkpoint) {
+export function projectCheckpoint(checkpoint, { maxRemaining = 50, summaryChars = LIMITS.finalText } = {}) {
   if (!checkpoint) return null
   return {
     status: checkpoint.status,
-    summary: clip(checkpoint.summary, LIMITS.finalText),
-    ...(checkpoint.remaining?.length ? { remaining: checkpoint.remaining.map(x => oneLine(x, 300)) } : {}),
+    summary: clip(checkpoint.summary, summaryChars),
+    ...(checkpoint.remaining?.length ? { remaining: checkpoint.remaining.slice(0, maxRemaining).map(x => oneLine(x, 300)) } : {}),
+    ...(checkpoint.remaining?.length > maxRemaining ? { remaining_not_shown: checkpoint.remaining.length - maxRemaining } : {}),
   }
 }
 
@@ -174,12 +209,24 @@ export function projectCheckpoint(checkpoint) {
  * but per-check output is trimmed to its tail: the exit code and the last lines
  * are what a reviewer reads.
  */
-export function projectEvidence(evidence) {
+export function projectEvidence(evidence, { maxFiles } = {}) {
   if (!evidence) return null
+  const changes = evidence.changes
+  const compact = maxFiles !== undefined
   return {
     all_checks_passed: evidence.all_checks_passed,
-    ...(evidence.checks ? { checks: evidence.checks.map(c => ({ name: c.name ?? c.command, exit_code: c.exit_code, ok: c.ok, ...(c.output_tail ? { output_tail: clip(c.output_tail, 600) } : {}) })) } : {}),
-    ...(evidence.changes ? { changes: evidence.changes } : {}),
+    ...(evidence.checks ? { checks: evidence.checks.map(c => ({
+      name: compact ? clip(c.name ?? c.command, 200) : c.name ?? c.command,
+      exit_code: c.exit_code, passed: c.passed ?? c.ok, ok: c.passed ?? c.ok,
+      ...(c.timed_out ? { timed_out: true } : {}), ...(c.skipped ? { skipped: c.skipped } : {}),
+      ...(c.output_tail && (!compact || !(c.passed ?? c.ok)) ? { output_tail: compact ? c.output_tail.slice(-250) : clip(c.output_tail, 600) } : {}),
+    })) } : {}),
+    ...(changes ? { changes: !compact ? changes : {
+      ...Object.fromEntries(['created', 'modified', 'deleted'].map(key => [key, (changes[key] || []).slice(0, maxFiles).map(entry => clip(entry.path ?? entry, 180))])),
+      counts: Object.fromEntries(['created', 'modified', 'deleted'].map(key => [key, (changes[key] || []).length])),
+      ...(changes.truncated ? { truncated: true } : {}),
+    } } : {}),
+    ...(evidence.same_folder_runs?.length ? { same_folder_runs: evidence.same_folder_runs } : {}),
     ...(evidence.evidence_sha256 ? { evidence_sha256: evidence.evidence_sha256 } : {}),
     ...(evidence.workspace_stamp ? { workspace_stamp: evidence.workspace_stamp } : {}),
   }
